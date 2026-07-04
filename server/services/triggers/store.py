@@ -117,6 +117,40 @@ class TriggerStore:
             rows = conn.execute(sql, params).fetchall()
         return [self._row_to_record(row) for row in rows]
 
+    def claim_due_triggers(
+        self, agent_name: Optional[str], before_iso: str
+    ) -> List[TriggerRecord]:
+        """Atomically transition due triggers to 'processing' status."""
+        select_sql = (
+            "SELECT id FROM triggers WHERE status = 'active' AND next_trigger IS NOT NULL"
+            " AND next_trigger <= ?"
+        )
+        params: List[Any] = [before_iso]
+        if agent_name:
+            select_sql += " AND agent_name = ?"
+            params.append(agent_name)
+
+        now_iso = to_storage_timestamp(utc_now())
+        update_sql = (
+            f"UPDATE triggers SET status = 'processing', updated_at = ?"
+            f" WHERE id IN ({select_sql})"
+        )
+        update_params = [now_iso] + params
+
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(update_sql, update_params)
+                claimed_rows = conn.execute(
+                    "SELECT * FROM triggers WHERE status = 'processing' AND updated_at = ?",
+                    (now_iso,),
+                ).fetchall()
+                conn.execute("COMMIT")
+                return [self._row_to_record(row) for row in claimed_rows]
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
     def clear_all(self) -> None:
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM triggers")
