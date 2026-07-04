@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from zoneinfo import ZoneInfo
@@ -189,6 +189,13 @@ class TriggerService:
         iso_cutoff = to_storage_timestamp(before)
         return self._store.fetch_due(agent_name, iso_cutoff)
 
+    def claim_due_triggers(
+        self, *, before: datetime, agent_name: Optional[str] = None
+    ) -> List[TriggerRecord]:
+        """Atomically transition due triggers to 'processing' status."""
+        iso_cutoff = to_storage_timestamp(before)
+        return self._store.claim_due_triggers(agent_name, iso_cutoff)
+
     def mark_as_completed(self, trigger_id: int, *, agent_name: str) -> None:
         self._store.update(
             trigger_id,
@@ -215,9 +222,8 @@ class TriggerService:
         fields: Dict[str, Any] = {
             "next_trigger": to_storage_timestamp(next_fire) if next_fire else None,
             "last_error": None,
+            "status": "active" if next_fire else "completed",
         }
-        if next_fire is None:
-            fields["status"] = "completed"
         self._store.update(trigger.id, trigger.agent_name, fields)
         return self._store.fetch_one(trigger.id, trigger.agent_name)
 
@@ -227,6 +233,7 @@ class TriggerService:
             trigger.agent_name,
             {
                 "last_error": error,
+                "status": "active" if trigger.recurrence_rule else "completed",
             },
         )
 
@@ -236,6 +243,7 @@ class TriggerService:
             agent_name,
             {
                 "next_trigger": None,
+                "status": "completed",
             },
         )
         return self._store.fetch_one(trigger_id, agent_name)
