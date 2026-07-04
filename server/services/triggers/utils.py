@@ -12,7 +12,7 @@ from ...logging_config import logger
 
 UTC = timezone.utc
 DEFAULT_STATUS = "active"
-VALID_STATUSES = {"active", "paused", "completed"}
+VALID_STATUSES = {"active", "paused", "completed", "processing"}
 
 
 def utc_now() -> datetime:
