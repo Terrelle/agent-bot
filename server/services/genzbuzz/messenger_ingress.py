@@ -137,8 +137,19 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
     confidence = str(frequency_turn.get("confidence") or "low").strip().lower()
     is_mixed_intent = bool(frequency_turn.get("mixed_intent"))
 
+    # Prefer current state over generic fallback when in a guided onboarding stage.
+    # Accepts common replies inside frequency choice flow without requiring 'high' confidence.
+    if onboarding_stage == "awaiting_frequency" and not terminal_sealed:
+        if frequency_intent == "select" and frequency_choice != "unknown":
+            # Loosen confidence requirement for guided frequency turns.
+            frequency_should_commit = True
+        elif frequency_intent == "none":
+            # If truly unknown/off-topic during onboarding, route to clarification instead of generic fallback.
+            frequency_intent = "needs_clarification"
+            frequency_should_commit = False
+
     # Commit only if semantic confidence is high and intent is not mixed.
-    if frequency_intent == "select" and (confidence != "high" or is_mixed_intent):
+    if frequency_intent == "select" and (confidence == "low" or is_mixed_intent) and onboarding_stage != "awaiting_frequency":
         frequency_intent = "needs_clarification"
         frequency_should_commit = False
 
@@ -402,7 +413,7 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
                 }
 
             elif has_pending_waiting_draft and draft_state == "FAILED":
-                if typed_intent == "APPROVE" and typed_confidence == "high":
+                if typed_intent == "APPROVE" and typed_confidence != "low":
                     _set_waiting_draft_state(
                         policy_service=policy_service,
                         draft_id=pending_draft_id,
@@ -455,7 +466,7 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
                         },
                         "error": "" if save_success else str(save_result.get("error") or "waiting_save_failed"),
                     }
-                elif typed_intent == "CANCEL" and typed_confidence == "high":
+                elif typed_intent == "CANCEL" and typed_confidence != "low":
                     _set_waiting_draft_state(
                         policy_service=policy_service,
                         draft_id=pending_draft_id,
@@ -535,7 +546,7 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
                     }
 
             elif has_pending_waiting_draft and not acknowledgement_only:
-                if typed_intent == "APPROVE" and typed_confidence == "high":
+                if typed_intent == "APPROVE" and typed_confidence != "low":
                     _set_waiting_draft_state(
                         policy_service=policy_service,
                         draft_id=pending_draft_id,
@@ -588,7 +599,7 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
                         },
                         "error": "" if save_success else str(save_result.get("error") or "waiting_save_failed"),
                     }
-                elif typed_intent == "CANCEL" and typed_confidence == "high":
+                elif typed_intent == "CANCEL" and typed_confidence != "low":
                     _set_waiting_draft_state(
                         policy_service=policy_service,
                         draft_id=pending_draft_id,
@@ -1834,5 +1845,3 @@ def _record_lifecycle_turn(*, session_key: str, user_text: str, reply_text: str)
             "Messenger lifecycle turn log append failed",
             extra={"error": str(exc), "session_key": session_key},
         )
-
-
