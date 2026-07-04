@@ -112,6 +112,7 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
         _set_onboarding_terminal_state(session_key=session_key, state="")
         _reset_lifecycle_emit_records(session_key=session_key)
     terminal_sealed = _is_onboarding_terminal_sealed(session_key=session_key)
+    terminal_sent = _get_onboarding_terminal_state(session_key=session_key) == "SENT"
     onboarding_active = bool(onboarding_data.get("active")) or onboarding_stage != ""
 
     waiting_state = _resolve_waiting_prompt_state(bridge=bridge, user_id=resolved_user_id)
@@ -128,6 +129,32 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
     has_pending_waiting_draft = bool(pending_waiting_draft.get("has_draft"))
 
     normalized_text = clean_text.lower().strip()
+
+    # Pre-check for acknowledgement in post-frequency SENT state.
+    # This prevents 'Thanks'/'Cool' from falling back to runtime immediately after save.
+    if terminal_sent and _looks_like_acknowledgement(normalized_text):
+        lifecycle_intent = "frequency"
+        lifecycle_success = True
+        lifecycle_message = "frequency_complete_ack"
+        lifecycle_context = {
+            "event": "frequency_complete_ack",
+            "success": True,
+            "result": {},
+            "error": "",
+        }
+        _set_onboarding_terminal_state(session_key=session_key, state="COMPLETE")
+        logger.info("Messenger onboarding final ack handled; psid=%s", clean_psid)
+        return await _finish_lifecycle_turn(
+            psid=clean_psid,
+            user_id=resolved_user_id,
+            user_text=clean_text,
+            lifecycle_intent=lifecycle_intent,
+            lifecycle_success=lifecycle_success,
+            lifecycle_message=lifecycle_message,
+            lifecycle_context=lifecycle_context,
+            session_key=session_key,
+        )
+
     # Meaning-first routing for frequency turns with semantic ambiguity checks.
     frequency_turn = await _classify_frequency_turn_semantic(clean_text)
     frequency_intent = str(frequency_turn.get("kind") or "").strip().lower()
@@ -349,6 +376,18 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
                 },
                 "error": "pending_frequency_selection",
             }
+
+    if lifecycle_context is not None:
+        return await _finish_lifecycle_turn(
+            psid=clean_psid,
+            user_id=resolved_user_id,
+            user_text=clean_text,
+            lifecycle_intent=lifecycle_intent,
+            lifecycle_success=lifecycle_success,
+            lifecycle_message=lifecycle_message,
+            lifecycle_context=lifecycle_context,
+            session_key=session_key,
+        )
 
     if lifecycle_context is None:
         waiting_flow_eligible = (
@@ -785,6 +824,18 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
                     "error": "",
                 }
 
+            if lifecycle_context is not None:
+                return await _finish_lifecycle_turn(
+                    psid=clean_psid,
+                    user_id=resolved_user_id,
+                    user_text=clean_text,
+                    lifecycle_intent=lifecycle_intent,
+                    lifecycle_success=lifecycle_success,
+                    lifecycle_message=lifecycle_message,
+                    lifecycle_context=lifecycle_context,
+                    session_key=session_key,
+                )
+
             logger.info(
                 "Messenger waiting flow routing; psid=%s; waiting_topic=%s; send_request=%s; typed_intent=%s; intent_confidence=%s; draft_state=%s; has_pending_draft=%s; lifecycle_selected=%s; execution_outcome=%s",
                 clean_psid,
@@ -797,67 +848,6 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
                 "true" if lifecycle_context is not None else "false",
                 execution_outcome,
             )
-
-    if lifecycle_context is not None and lifecycle_intent is not None and lifecycle_success is not None and lifecycle_message is not None:
-        logger.info(
-            "Messenger lifecycle direct reply path; psid=%s; intent=%s; success=%s; message=%s",
-            clean_psid,
-            lifecycle_intent,
-            "true" if lifecycle_success else "false",
-            lifecycle_message,
-        )
-        correlation_id = ""
-        if _is_terminal_frequency_confirmation_event(
-            lifecycle_intent=lifecycle_intent,
-            lifecycle_success=lifecycle_success,
-            lifecycle_context=lifecycle_context,
-        ):
-            correlation_id = _build_lifecycle_correlation_id(
-                session_key=session_key,
-                lifecycle_intent=lifecycle_intent,
-                lifecycle_context=lifecycle_context,
-            )
-            if _is_lifecycle_emit_already_sent(session_key=session_key, correlation_id=correlation_id):
-                logger.info(
-                    "Messenger lifecycle duplicate emit suppressed; psid=%s; correlation_id=%s",
-                    clean_psid,
-                    correlation_id,
-                )
-                return MessengerIngressResult(
-                    handled=True,
-                    intent=lifecycle_intent,
-                    success=True,
-                    message="frequency_terminal_emit_duplicate_suppressed",
-                    user_id=resolved_user_id,
-                    reply_text="",
-                )
-            _mark_lifecycle_emit_sent(session_key=session_key, correlation_id=correlation_id)
-            lifecycle_context["correlation_id"] = correlation_id
-
-        sanitized_lifecycle_context = _sanitize_lifecycle_context_for_generation(lifecycle_context)
-        lifecycle_reply = _build_waiting_prompt_direct_reply(
-            user_text=clean_text,
-            lifecycle_context=sanitized_lifecycle_context,
-        )
-        if lifecycle_reply == "":
-            lifecycle_reply = await _generate_lifecycle_reply(
-                psid=clean_psid,
-                user_id=resolved_user_id,
-                user_text=clean_text,
-                lifecycle_context=sanitized_lifecycle_context,
-            )
-        lifecycle_reply = _sanitize_lifecycle_reply_text(lifecycle_reply)
-        if correlation_id:
-            _set_onboarding_terminal_state(session_key=session_key, state="SENT")
-        _record_lifecycle_turn(session_key=f"messenger:{clean_psid}", user_text=clean_text, reply_text=lifecycle_reply)
-        return MessengerIngressResult(
-            handled=True,
-            intent=lifecycle_intent,
-            success=lifecycle_success,
-            message=lifecycle_message,
-            user_id=resolved_user_id,
-            reply_text=lifecycle_reply,
-        )
 
     try:
         runtime = InteractionAgentRuntime(session_key=f"messenger:{clean_psid}")
@@ -927,6 +917,79 @@ async def route_messenger_ingress(*, psid: str, text: str, user_id: Optional[int
 
 
 __all__ = ["MessengerIngressResult", "route_messenger_ingress"]
+
+
+async def _finish_lifecycle_turn(
+    *,
+    psid: str,
+    user_id: int,
+    user_text: str,
+    lifecycle_intent: str,
+    lifecycle_success: bool,
+    lifecycle_message: str,
+    lifecycle_context: Dict[str, Any],
+    session_key: str,
+) -> MessengerIngressResult:
+    logger.info(
+        "Messenger lifecycle direct reply path; psid=%s; intent=%s; success=%s; message=%s",
+        psid,
+        lifecycle_intent,
+        "true" if lifecycle_success else "false",
+        lifecycle_message,
+    )
+    correlation_id = ""
+    if _is_terminal_frequency_confirmation_event(
+        lifecycle_intent=lifecycle_intent,
+        lifecycle_success=lifecycle_success,
+        lifecycle_context=lifecycle_context,
+    ):
+        correlation_id = _build_lifecycle_correlation_id(
+            session_key=session_key,
+            lifecycle_intent=lifecycle_intent,
+            lifecycle_context=lifecycle_context,
+        )
+        if _is_lifecycle_emit_already_sent(session_key=session_key, correlation_id=correlation_id):
+            logger.info(
+                "Messenger lifecycle duplicate emit suppressed; psid=%s; correlation_id=%s",
+                psid,
+                correlation_id,
+            )
+            return MessengerIngressResult(
+                handled=True,
+                intent=lifecycle_intent,
+                success=True,
+                message="frequency_terminal_emit_duplicate_suppressed",
+                user_id=user_id,
+                reply_text="",
+            )
+        _mark_lifecycle_emit_sent(session_key=session_key, correlation_id=correlation_id)
+        lifecycle_context["correlation_id"] = correlation_id
+
+    sanitized_lifecycle_context = _sanitize_lifecycle_context_for_generation(lifecycle_context)
+    lifecycle_reply = _build_waiting_prompt_direct_reply(
+        user_text=user_text,
+        lifecycle_context=sanitized_lifecycle_context,
+    )
+    if lifecycle_reply == "":
+        lifecycle_reply = await _generate_lifecycle_reply(
+            psid=psid,
+            user_id=user_id,
+            user_text=user_text,
+            lifecycle_context=sanitized_lifecycle_context,
+        )
+    lifecycle_reply = _sanitize_lifecycle_reply_text(lifecycle_reply)
+    if correlation_id and _get_onboarding_terminal_state(session_key=session_key) != "COMPLETE":
+        _set_onboarding_terminal_state(session_key=session_key, state="SENT")
+
+    _record_lifecycle_turn(session_key=f"messenger:{psid}", user_text=user_text, reply_text=lifecycle_reply)
+    return MessengerIngressResult(
+        handled=True,
+        intent=lifecycle_intent,
+        success=lifecycle_success,
+        message=lifecycle_message,
+        user_id=user_id,
+        reply_text=lifecycle_reply,
+    )
 
 
 async def _classify_frequency_turn_semantic(text: str) -> Dict[str, Any]:
@@ -1146,6 +1209,7 @@ async def _generate_lifecycle_reply(
         "If lifecycle_context.event is frequency and success is true, confirm the saved cadence and do not ask the user to choose cadence options again in that same message. "
         "If lifecycle_context.event is frequency and success is false, ask a natural clarifying question and do not claim frequency was saved. "
         "If lifecycle_context.event is frequency_anchor_offtopic, briefly acknowledge the user's message, then steer back to the required cadence choice with exactly weekly, biweekly, or monthly. "
+        "If lifecycle_context.event is frequency_complete_ack, confirm you're excited for their first check-in soon and offer a friendly sign-off like 'catch you soon'."
         "If lifecycle_context.event is waiting_unresolved_no_draft, reply naturally to the user first and then bring up the unresolved waiting prompt in one gentle sentence. "
         "If lifecycle_context.event is waiting_prompt_clarify, answer the user's meta-question briefly and re-emit the original waiting prompt text in the same message. "
         "If lifecycle_context.event is waiting_prompt_clarify_example, provide one or two concrete sample answers for the active prompt, then re-emit the prompt. "
@@ -1287,7 +1351,7 @@ def _looks_like_acknowledgement(text: str) -> bool:
         return False
 
     normalized = re.sub(r"[^a-z0-9\s]", "", candidate).strip()
-    if normalized in {"thanks", "thank you", "ok", "okay", "cool", "got it", "k", "kk", "nice"}:
+    if normalized in {"thanks", "thank you", "ok", "okay", "cool", "got it", "k", "kk", "nice", "great", "awesome", "sweat", "perf", "perfect"}:
         return True
 
     if len(normalized.split()) <= 3 and normalized.startswith("thank"):
@@ -1653,9 +1717,14 @@ def _set_onboarding_terminal_state(*, session_key: str, state: str) -> None:
         _onboarding_terminal_state.pop(key, None)
 
 
+def _get_onboarding_terminal_state(*, session_key: str) -> str:
+    key = (session_key or "").strip() or "default"
+    return str(_onboarding_terminal_state.get(key) or "").strip().upper()
+
+
 def _is_onboarding_terminal_sealed(*, session_key: str) -> bool:
     key = (session_key or "").strip() or "default"
-    return _onboarding_terminal_state.get(key) in {"SENT", "COMPLETE", "IDLE"}
+    return _onboarding_terminal_state.get(key) in {"COMPLETE", "IDLE"}
 
 
 def _is_terminal_frequency_confirmation_event(
