@@ -67,7 +67,8 @@ class TriggerScheduler:
 
     async def _poll_once(self) -> None:
         now = _utc_now()
-        due_triggers = self._service.get_due_triggers(before=now)
+        # Atomically claim triggers by transitioning them to 'processing' status
+        due_triggers = self._service.claim_due_triggers(before=now)
         if not due_triggers:
             return
 
@@ -125,10 +126,6 @@ class TriggerScheduler:
             },
         )
         self._service.record_failure(trigger, error)
-        if trigger.recurrence_rule:
-            self._service.schedule_next_occurrence(trigger, fired_at=fired_at)
-        else:
-            self._service.clear_next_fire(trigger.id, agent_name=trigger.agent_name)
 
     def _format_instructions(self, trigger: TriggerRecord, fired_at: datetime) -> str:
         scheduled_for = trigger.next_trigger or _isoformat(fired_at)
