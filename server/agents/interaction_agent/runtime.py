@@ -79,12 +79,13 @@ class InteractionAgentRuntime:
     )
 
     # Initialize interaction agent runtime with settings and service dependencies
-    def __init__(self, session_key: Optional[str] = None) -> None:
+    def __init__(self, session_key: Optional[str] = None, cadence: Optional[str] = None) -> None:
         settings = get_settings()
         self.api_key = settings.openrouter_api_key
         self.model = settings.interaction_agent_model
         self.settings = settings
         self.session_key = session_key
+        self.cadence = cadence
         self.conversation_log = get_conversation_log(session_key=session_key)
         self.working_memory_log = get_working_memory_log(session_key=session_key)
         self.tool_schemas = self._resolve_tool_schemas()
@@ -103,7 +104,7 @@ class InteractionAgentRuntime:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_user_message(user_message)
 
-            system_prompt = build_system_prompt()
+            system_prompt = build_system_prompt(cadence=self.cadence)
             messages = prepare_message_with_history(
                 user_message, transcript_before, message_type="user"
             )
@@ -151,7 +152,7 @@ class InteractionAgentRuntime:
             transcript_before = self._load_conversation_transcript()
             self.conversation_log.record_agent_message(agent_message)
 
-            system_prompt = build_system_prompt()
+            system_prompt = build_system_prompt(cadence=self.cadence)
             messages = prepare_message_with_history(
                 agent_message, transcript_before, message_type="agent"
             )
@@ -605,230 +606,125 @@ class InteractionAgentRuntime:
             return summary.user_messages[0]
 
         candidate = summary.last_assistant_text.strip()
-        normalized = self._normalize_assistant_response(
-            candidate,
-            had_tool_rejection=summary.had_tool_rejection,
-        )
-        if normalized:
-            return normalized
 
-        logger.warning("Suppressing unsafe assistant text; returning safe fallback")
-        return self.SAFE_FALLBACK_RESPONSE
-
-    def _normalize_assistant_response(self, text: str, *, had_tool_rejection: bool) -> str:
-        candidate = unescape((text or "").strip())
-        if candidate == "":
-            return ""
-
-        # Strip common parser debris prefixes like '?:>' while preserving meaning.
-        candidate = re.sub(r"^[\s:;>\?]+", "", candidate).strip()
-        candidate = self._strip_wrapping_quotes(candidate)
-
-        extracted = self._extract_message_from_structured_text(candidate)
-        if extracted:
-            logger.warning("Recovered user message from structured assistant payload")
-            return extracted
-
-        looks_structural = self._looks_like_function_payload(candidate) or self._looks_like_tool_markup(candidate)
-        if looks_structural:
-            return ""
-
-        if self._looks_like_internal_meta(candidate):
-            return ""
-
-        if had_tool_rejection and self._contains_structural_artifacts(candidate):
-            logger.warning("Dropping assistant fallback after tool rejection due to structural artifacts")
-            return ""
+        # Final safety: strip internal process chatter if it leaked into the assistant text.
+        for pattern in self.INTERNAL_META_PATTERNS:
+            if pattern in candidate.lower():
+                logger.warning(
+                    "Assistant reply contains internal metadata; returning safe fallback",
+                    extra={"pattern": pattern},
+                )
+                return self.SAFE_FALLBACK_RESPONSE
 
         return candidate
-
-    def _strip_wrapping_quotes(self, text: str) -> str:
-        candidate = (text or "").strip()
-        if len(candidate) >= 2 and ((candidate[0] == '"' and candidate[-1] == '"') or (candidate[0] == "'" and candidate[-1] == "'")):
-            return candidate[1:-1].strip()
-        return candidate
-
-    def _extract_message_from_structured_text(self, text: str) -> str:
-        candidate = (text or "").strip()
-        if candidate == "":
-            return ""
-
-        # XML-like pseudo-tool payloads: <send_message_to_user>{...}</send_message_to_user>
-        markup_match = re.search(
-            r"<([a-z_][a-z0-9_]*)>\s*(\{.*?\})\s*</\1>",
-            candidate,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        if markup_match:
-            payload = self._try_parse_json_object(markup_match.group(2))
-            message = self._extract_user_message_from_payload(payload)
-            if message:
-                return message
-
-        # Whole-text JSON payloads.
-        payload = self._try_parse_json_object(candidate)
-        message = self._extract_user_message_from_payload(payload)
-        if message:
-            return message
-
-        # Scan for embedded JSON objects inside surrounding noise and recover message.
-        for embedded in self._iter_json_objects(candidate):
-            message = self._extract_user_message_from_payload(embedded)
-            if message:
-                return message
-
-        return ""
-
-    def _try_parse_json_object(self, text: str) -> Optional[Dict[str, Any]]:
-        raw = (text or "").strip()
-        if not raw.startswith("{"):
-            return None
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-        if isinstance(parsed, dict):
-            return parsed
-        return None
-
-    def _iter_json_objects(self, text: str) -> List[Dict[str, Any]]:
-        source = text or ""
-        decoder = json.JSONDecoder()
-        found: List[Dict[str, Any]] = []
-        for match in re.finditer(r"\{", source):
-            idx = match.start()
-            try:
-                parsed, _ = decoder.raw_decode(source[idx:])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict):
-                found.append(parsed)
-        return found
-
-    def _extract_user_message_from_payload(self, payload: Optional[Dict[str, Any]]) -> str:
-        if not isinstance(payload, dict):
-            return ""
-
-        for key in ("message", "text", "response"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-
-        for container_key in ("parameters", "arguments"):
-            nested = payload.get(container_key)
-            if isinstance(nested, dict):
-                for key in ("message", "text", "response"):
-                    value = nested.get(key)
-                    if isinstance(value, str) and value.strip():
-                        return value.strip()
-
-        return ""
-
-    def _looks_like_internal_meta(self, text: str) -> bool:
-        lowered = (text or "").lower().strip()
-        if not lowered:
-            return False
-        return any(token in lowered for token in self.INTERNAL_META_PATTERNS)
-
-    def _looks_like_function_payload(self, text: str) -> bool:
-        lowered = (text or "").lower()
-        if not lowered:
-            return False
-
-        # Compact tool envelope form seen in some model outputs:
-        # {"name": "send_message_to_user", "parameters": {...}}
-        has_compact_tool_name = bool(self.TOOL_ENVELOPE_NAME_PATTERN.search(lowered))
-        has_compact_params = '"parameters"' in lowered or '"arguments"' in lowered
-        if has_compact_tool_name and has_compact_params:
-            return True
-
-        # OpenAI function-wrapper form:
-        # {"type":"function","name":"send_message_to_user","parameters":{...}}
-        has_type = '"type"' in lowered and '"function"' in lowered
-        has_name = '"name"' in lowered and (
-            '"send_message_to_user"' in lowered
-            or '"send_draft"' in lowered
-            or '"send_message_to_agent"' in lowered
-            or '"wait"' in lowered
-        )
-        has_parameters = '"parameters"' in lowered or '"arguments"' in lowered
-        return has_type and has_name and has_parameters
-
-    def _looks_like_tool_markup(self, text: str) -> bool:
-        lowered = (text or "").lower()
-        if not lowered:
-            return False
-        return bool(
-            re.search(r"</?(send_message_to_user|send_draft|send_message_to_agent|wait)>", lowered)
-        )
-
-    def _contains_structural_artifacts(self, text: str) -> bool:
-        lowered = (text or "").lower()
-        if not lowered:
-            return False
-
-        has_openai_wrapper = (
-            '"type"' in lowered
-            and '"function"' in lowered
-            and ('"parameters"' in lowered or '"arguments"' in lowered)
-        )
-        has_compact_tool_envelope = bool(self.TOOL_ENVELOPE_NAME_PATTERN.search(lowered)) and (
-            '"parameters"' in lowered or '"arguments"' in lowered
-        )
-
-        return has_openai_wrapper or has_compact_tool_envelope or self._looks_like_tool_markup(text)
 
     def _is_messenger_session(self) -> bool:
-        key = (self.session_key or "").strip().lower()
-        return key.startswith("messenger:")
-
-    def _resolve_tool_schemas(self) -> List[Dict[str, Any]]:
-        schemas = get_tool_schemas()
-        if not self._is_messenger_session():
-            return schemas
-
-        # For Messenger, keep interaction replies user-facing and synchronous.
-        # Disable agent fan-out and draft plumbing that can leak internal chatter.
-        allowed = {"send_message_to_user"}
-        filtered: List[Dict[str, Any]] = []
-        for schema in schemas:
-            function_block = (schema or {}).get("function") or {}
-            name = function_block.get("name")
-            if isinstance(name, str) and name in allowed:
-                filtered.append(schema)
-
-        return filtered
+        return isinstance(self.session_key, str) and self.session_key.startswith("messenger:")
 
     def _compact_messenger_transcript(self, transcript: str) -> str:
-        source = (transcript or "").strip()
-        if not source:
-            return ""
+        """Return only the latest turns for Messenger to keep prompt tokens low."""
 
-        # Keep only human-visible turns so stale agent/wait/debug chatter
-        # cannot steer replies in active Messenger sessions.
-        pattern = re.compile(
-            r"<(user_message|genzbuzz_reply)(?:\s+[^>]*)?>.*?</\1>",
-            flags=re.DOTALL,
+        lines = transcript.strip().splitlines()
+        if len(lines) <= self.MESSENGER_HISTORY_TURNS:
+            return transcript
+
+        compact = lines[-self.MESSENGER_HISTORY_TURNS :]
+        return "[messenger_history_truncated]\n" + "\n".join(compact)
+
+    def _resolve_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return the tool schemas available to the interaction agent."""
+
+        schemas = get_tool_schemas()
+
+        # The interaction agent always has a set of user-visible messaging tools.
+        # These are not execution-agent tools.
+        schemas.extend(
+            [
+                {
+                    "name": "send_message_to_user",
+                    "description": "Send a natural language message to the user.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "text": {
+                                "type": "string",
+                                "description": "The natural language text to send.",
+                            }
+                        },
+                        "required": ["text"],
+                    },
+                },
+                {
+                    "name": "send_message_to_agent",
+                    "description": (
+                        "Hand off work to a specialized execution agent. "
+                        "The agent will execute your instructions and report back."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "agent_name": {
+                                "type": "string",
+                                "description": "The name of the agent to invoke.",
+                            },
+                            "instructions": {
+                                "type": "string",
+                                "description": "Detailed instructions for the agent.",
+                            },
+                        },
+                        "required": ["agent_name", "instructions"],
+                    },
+                },
+                {
+                    "name": "send_draft",
+                    "description": (
+                        "Confirm or edit an outbound content draft generated by an execution agent. "
+                        "Used for waiting, bonding, or spontaneous mementos. "
+                        "The user must approve the draft before it can be sent."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "draft_kind": {
+                                "type": "string",
+                                "enum": ["waiting", "bonding", "spontaneous"],
+                                "description": "The kind of draft to send.",
+                            },
+                            "draft_id": {
+                                "type": "string",
+                                "description": "The UUID of the draft to send.",
+                            },
+                            "action": {
+                                "type": "string",
+                                "enum": ["approve", "edit", "cancel"],
+                                "description": "The action to take on the draft.",
+                            },
+                            "edit_instructions": {
+                                "type": "string",
+                                "description": "Instructions for editing the draft if action='edit'.",
+                            },
+                        },
+                        "required": ["draft_kind", "draft_id", "action"],
+                    },
+                },
+                {
+                    "name": "wait",
+                    "description": (
+                        "Stop processing and wait for the user or an agent to respond. "
+                        "Used when an action is pending or no more work can be done in this turn."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "reason": {
+                                "type": "string",
+                                "description": "Short explanation for why we are waiting.",
+                            }
+                        },
+                        "required": ["reason"],
+                    },
+                },
+            ]
         )
-        matches = pattern.finditer(source)
-        selected: List[str] = []
-        for match in matches:
-            selected.append(match.group(0).strip())
 
-        if not selected:
-            return ""
-
-        # Drop consecutive duplicate bot replies to avoid amplifying stale phrasing.
-        deduped: List[str] = []
-        last_reply_body = ""
-        for entry in selected:
-            if entry.startswith("<genzbuzz_reply"):
-                body = re.sub(r"^<genzbuzz_reply(?:\s+[^>]*)?>|</genzbuzz_reply>$", "", entry, flags=re.DOTALL).strip()
-                if body == last_reply_body:
-                    continue
-                last_reply_body = body
-            deduped.append(entry)
-
-        selected = deduped
-
-        return "\n".join(selected[-self.MESSENGER_HISTORY_TURNS :])
+        return schemas
