@@ -2,7 +2,7 @@
 
 from html import escape
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from ...services.execution import get_agent_roster
 
@@ -12,8 +12,10 @@ MAX_HISTORY_CHARS = 4000
 
 
 # Load and return the pre-defined system prompt from markdown file
-def build_system_prompt() -> str:
+def build_system_prompt(cadence: Optional[str] = None) -> str:
     """Return the static system prompt for the interaction agent."""
+    if cadence:
+        return f"{SYSTEM_PROMPT}\n\n[HARD OVERRIDE] User's saved cadence: {cadence}. Use this for all frequency framing."
     return SYSTEM_PROMPT
 
 
